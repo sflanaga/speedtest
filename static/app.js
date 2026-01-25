@@ -1,6 +1,16 @@
 (() => {
   const logEl = document.getElementById("log");
   const verboseToggle = document.getElementById("verbose");
+  const wsInput = document.getElementById("wsUrl");
+
+  const defaultWsUrl = () => {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}/ws`;
+  };
+
+  // Auto-fill WS URL from the current page location
+  wsInput.value = defaultWsUrl();
+
   const log = (msg, { verbose = false } = {}) => {
     if (verbose && !verboseToggle.checked) return;
     const t = new Date().toISOString();
@@ -71,7 +81,7 @@
 
   async function run() {
     try {
-      const url = document.getElementById("wsUrl").value;
+      const url = wsInput.value;
       const chunkBytes = parseBytesInput(document.getElementById("chunkBytes").value);
       const pingDuration = parseInt(document.getElementById("pingDuration").value, 10);
       const pingMaxCountInput = document.getElementById("pingMaxCount").value;
