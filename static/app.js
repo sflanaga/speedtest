@@ -20,9 +20,10 @@
       }, 1);
     });
 
+  // Accepts B, K, KB, KiB, M, MB, MiB, G, GB, GiB (case-insensitive)
   const parseBytesInput = (s) => {
     if (!s || !s.trim()) throw new Error("Empty byte value");
-    const m = s.trim().match(/^(\d+(?:\.\d+)?)(?:\s*(b|kb|kib|mb|mib|gb|gib))?$/i);
+    const m = s.trim().match(/^(\d+(?:\.\d+)?)(?:\s*(b|k|kb|kib|m|mb|mib|g|gb|gib))?$/i);
     if (!m) throw new Error("Invalid byte value");
     const num = parseFloat(m[1]);
     const unit = (m[2] || "b").toLowerCase();
@@ -30,12 +31,15 @@
       switch (unit) {
         case "b":
           return 1;
+        case "k":
         case "kb":
         case "kib":
           return 1024;
+        case "m":
         case "mb":
         case "mib":
           return 1024 ** 2;
+        case "g":
         case "gb":
         case "gib":
           return 1024 ** 3;

@@ -13,13 +13,13 @@
   <h1>LAN Speed Test</h1>
   <div>
     <label>Server WS URL: <input id="wsUrl" size="40" value="ws://localhost:8080/ws" /></label>
-    <label>Chunk bytes: <input id="chunkBytes" type="number" value="65536" /></label>
+    <label>Chunk bytes: <input id="chunkBytes" type="text" value="65536" /></label>
     <label>Ping duration (ms): <input id="pingDuration" type="number" value="5000" /></label>
     <label>Ping max count (optional): <input id="pingMaxCount" type="number" /></label>
     <label>Download duration (ms): <input id="dlDuration" type="number" value="5000" /></label>
-    <label>Download max bytes: <input id="dlMaxBytes" type="number" value="40000000" /></label>
+    <label>Download max bytes: <input id="dlMaxBytes" type="text" value="40000000" /></label>
     <label>Upload duration (ms): <input id="ulDuration" type="number" value="5000" /></label>
-    <label>Upload max bytes: <input id="ulMaxBytes" type="number" value="40000000" /></label>
+    <label>Upload max bytes: <input id="ulMaxBytes" type="text" value="40000000" /></label>
     <label><input id="verbose" type="checkbox" /> Verbose logging</label>
     <button id="start">Run Test</button>
   </div>
