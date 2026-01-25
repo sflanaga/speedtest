@@ -9,6 +9,16 @@
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const waitForBufferedAmount = (ws, threshold = 256_000) =>
+    new Promise((resolve) => {
+      if (ws.bufferedAmount < threshold) return resolve();
+      const id = setInterval(() => {
+        if (ws.bufferedAmount < threshold) {
+          clearInterval(id);
+          resolve();
+        }
+      }, 1);
+    });
 
   document.getElementById("start").addEventListener("click", run);
 
@@ -36,6 +46,8 @@
       dlMaxBytes,
       ulDuration,
       ulMaxBytes,
+      uploadServerDone: false,
+      uploadDoneAck: null,
     };
 
     ws.onclose = () => log("WebSocket closed");
@@ -97,7 +109,6 @@
       seq += 1;
     }
 
-    // Tell server we're done
     ctx.ws.send(JSON.stringify({ phase: "ping", done: true }));
     const avg = ctx.pingStats.count ? ctx.pingStats.sum / ctx.pingStats.count : 0;
     log(
@@ -123,7 +134,7 @@
       const seq = msg.seq;
       const tSend = ctx.awaiting.get(seq);
       if (tSend != null) {
-        const rtt = nowMs() - tSend; // measure with client clock to avoid skew
+        const rtt = nowMs() - tSend;
         ctx.awaiting.delete(seq);
         ctx.pingStats.count += 1;
         ctx.pingStats.sum += rtt;
@@ -147,6 +158,8 @@
           verbose: true,
         });
       } else {
+        ctx.uploadServerDone = true;
+        ctx.uploadServerResult = msg;
         log(
           `Upload done: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms reason=${msg.reason}`
         );
@@ -169,7 +182,6 @@
       })
     );
 
-    // Wait for done control
     await new Promise((resolve) => {
       const handler = (evt) => {
         if (typeof evt.data === "string") {
@@ -196,6 +208,10 @@
     const buf = new Uint8Array(ctx.chunkBytes);
     crypto.getRandomValues(buf);
 
+    ctx.uploadServerDone = false;
+    ctx.uploadServerResult = null;
+    const ackPromise = new Promise((resolve) => (ctx.uploadDoneAck = resolve));
+
     ctx.ws.send(
       JSON.stringify({
         phase: "upload",
@@ -209,28 +225,41 @@
     const start = performance.now();
     let sent = 0;
 
-    while (performance.now() - start < ctx.ulDuration && sent < ctx.ulMaxBytes) {
+    while (
+      !ctx.uploadServerDone &&
+      performance.now() - start < ctx.ulDuration &&
+      sent < ctx.ulMaxBytes
+    ) {
+      if (ctx.ws.bufferedAmount > 512_000) {
+        await waitForBufferedAmount(ctx.ws, 256_000);
+      }
       ctx.ws.send(buf);
       sent += buf.byteLength;
       if (sent % (ctx.chunkBytes * 8) === 0) await sleep(0);
     }
 
-    const elapsed = performance.now() - start;
-    const ackPromise = new Promise((resolve) => (ctx.uploadDoneAck = resolve));
-    ctx.ws.send(
-      JSON.stringify({
-        phase: "upload",
-        done: true,
-        bytes_sent: sent,
-        elapsed_ms: Math.round(elapsed),
-      })
-    );
-    await ackPromise;
-    log(
-      `Upload sent ${(sent / 1e6).toFixed(2)} MB in ${elapsed.toFixed(
-        1
-      )} ms (~${((sent * 8) / elapsed / 1e3).toFixed(2)} Mbps)`
-    );
+    if (!ctx.uploadServerDone) {
+      const elapsed = performance.now() - start;
+      ctx.ws.send(
+        JSON.stringify({
+          phase: "upload",
+          done: true,
+          bytes_sent: sent,
+          elapsed_ms: Math.round(elapsed),
+        })
+      );
+    }
+
+    await ackPromise; // wait for server's done/ack message
+
+    if (!ctx.uploadServerResult) {
+      // Should not happen, but guard
+      log(
+        `Upload sent ${(sent / 1e6).toFixed(2)} MB in ${((performance.now() - start)).toFixed(
+          1
+        )} ms (~${((sent * 8) / (performance.now() - start) / 1e3).toFixed(2)} Mbps)`
+      );
+    }
   }
 
   function nowMs() {
