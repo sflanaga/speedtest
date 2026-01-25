@@ -32,31 +32,42 @@ type WsSender = futures_util::stream::SplitSink<WebSocket, Message>;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lan-speedtest")]
+#[command(author, version, about)]
 struct Cli {
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    /// Address to bind to (e.g. 0.0.0.0:8080)
+    #[arg(short = 'b', long, default_value = "0.0.0.0:8080")]
     bind: String,
 
-    #[arg(long, default_value_t = 5000)]
+    /// Duration of ping test in ms
+    #[arg(short = 'p', long, default_value_t = 5000)]
     ping_duration_ms: u64,
-    #[arg(long)]
+
+    /// Max number of pings to send
+    #[arg(short = 'c', long)]
     ping_max_count: Option<u64>,
 
-    #[arg(long, default_value = "40000000", value_parser = parse_bytes)]
+    /// Max bytes to download (e.g. 40MB)
+    #[arg(short = 'D', long, default_value = "40000000", value_parser = parse_bytes)]
     download_max_bytes: u64,
 
-    #[arg(long, default_value_t = 5000)]
+    /// Duration of download test in ms
+    #[arg(short = 'd', long, default_value_t = 5000)]
     download_duration_ms: u64,
 
-    #[arg(long, default_value = "40000000", value_parser = parse_bytes)]
+    /// Max bytes to upload (e.g. 40MB)
+    #[arg(short = 'U', long, default_value = "40000000", value_parser = parse_bytes)]
     upload_max_bytes: u64,
 
-    #[arg(long, default_value_t = 5000)]
+    /// Duration of upload test in ms
+    #[arg(short = 'u', long, default_value_t = 5000)]
     upload_duration_ms: u64,
 
-    #[arg(long, default_value = "65536", value_parser = parse_chunk_bytes)]
+    /// Size of individual data chunks
+    #[arg(short = 'k', long, default_value = "65536", value_parser = parse_chunk_bytes)]
     chunk_bytes: usize,
 
-    #[arg(long, default_value_t = 250)]
+    /// Interval between stats updates in ms
+    #[arg(short = 's', long, default_value_t = 250)]
     stats_interval_ms: u64,
 }
 
