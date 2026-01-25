@@ -33,7 +33,10 @@
     const ulDuration = parseInt(document.getElementById("ulDuration").value, 10);
     const ulMaxBytes = parseInt(document.getElementById("ulMaxBytes").value, 10);
 
-    log(`Connecting to ${url} ...`, { verbose: true });
+    log(
+      `===== Starting LAN speed test: ws=${url} chunk=${chunkBytes}B ping_dur=${pingDuration}ms ping_max=${pingMaxCount ?? "none"} dl_dur=${dlDuration}ms dl_max=${dlMaxBytes}B ul_dur=${ulDuration}ms ul_max=${ulMaxBytes}B =====`
+    );
+
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
 
@@ -48,6 +51,8 @@
       ulMaxBytes,
       uploadServerDone: false,
       uploadDoneAck: null,
+      downloadResult: null,
+      uploadResult: null,
     };
 
     ws.onclose = () => log("WebSocket closed");
@@ -70,6 +75,14 @@
     await downloadPhase(ctx);
     await uploadPhase(ctx);
 
+    const pingAvg = ctx.pingStats.count ? ctx.pingStats.sum / ctx.pingStats.count : 0;
+    const dlRate = ctx.downloadResult?.rate_mbps ?? 0;
+    const ulRate = ctx.uploadResult?.rate_mbps ?? 0;
+    log(
+      `===== Summary: ping_avg=${pingAvg.toFixed(2)} ms download=${dlRate.toFixed(
+        2
+      )} Mbps upload=${ulRate.toFixed(2)} Mbps =====`
+    );
     log("All phases done.");
   }
 
@@ -79,7 +92,7 @@
 
   // ---------------- Ping ----------------
   async function pingPhase(ctx) {
-    log("Starting ping phase", { verbose: true });
+    log(">>> Ping phase starting");
     ctx.pingStats = { count: 0, sum: 0, min: Infinity, max: 0 };
     ctx.awaiting = new Map();
 
@@ -148,8 +161,17 @@
           verbose: true,
         });
       } else {
+        const rateMbps = msg.elapsed_ms > 0 ? (msg.bytes * 8) / msg.elapsed_ms / 1000 : 0;
+        ctx.downloadResult = {
+          bytes: msg.bytes,
+          elapsed_ms: msg.elapsed_ms,
+          rate_mbps: rateMbps,
+          reason: msg.reason,
+        };
         log(
-          `Download done: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms reason=${msg.reason}`
+          `Download done: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms reason=${msg.reason} (${rateMbps.toFixed(
+            2
+          )} Mbps)`
         );
       }
     } else if (msg.phase === "upload") {
@@ -158,10 +180,19 @@
           verbose: true,
         });
       } else {
+        const rateMbps = msg.elapsed_ms > 0 ? (msg.bytes * 8) / msg.elapsed_ms / 1000 : 0;
         ctx.uploadServerDone = true;
         ctx.uploadServerResult = msg;
+        ctx.uploadResult = {
+          bytes: msg.bytes,
+          elapsed_ms: msg.elapsed_ms,
+          rate_mbps: rateMbps,
+          reason: msg.reason,
+        };
         log(
-          `Upload done: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms reason=${msg.reason}`
+          `Upload done: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms reason=${msg.reason} (${rateMbps.toFixed(
+            2
+          )} Mbps)`
         );
         ctx.uploadDoneAck?.();
       }
@@ -170,7 +201,7 @@
 
   // ---------------- Download ----------------
   async function downloadPhase(ctx) {
-    log("Starting download phase", { verbose: true });
+    log(">>> Download phase starting");
     ctx.downloadBytes = 0;
     ctx.ws.send(
       JSON.stringify({
@@ -195,21 +226,24 @@
       ctx.ws.addEventListener("message", handler);
     });
 
-    log(
-      `Download collected ${(ctx.downloadBytes / 1e6).toFixed(
-        2
-      )} MB (${(ctx.downloadBytes * 8 / ctx.dlDuration / 1e3).toFixed(2)} Mbps approximate)`
-    );
+    if (ctx.downloadResult) {
+      log(
+        `Download collected ${(ctx.downloadResult.bytes / 1e6).toFixed(
+          2
+        )} MB (${ctx.downloadResult.rate_mbps.toFixed(2)} Mbps)`
+      );
+    }
   }
 
   // ---------------- Upload ----------------
   async function uploadPhase(ctx) {
-    log("Starting upload phase", { verbose: true });
+    log(">>> Upload phase starting");
     const buf = new Uint8Array(ctx.chunkBytes);
     crypto.getRandomValues(buf);
 
     ctx.uploadServerDone = false;
     ctx.uploadServerResult = null;
+    ctx.uploadResult = null;
     const ackPromise = new Promise((resolve) => (ctx.uploadDoneAck = resolve));
 
     ctx.ws.send(
@@ -252,12 +286,11 @@
 
     await ackPromise; // wait for server's done/ack message
 
-    if (!ctx.uploadServerResult) {
-      // Should not happen, but guard
+    if (ctx.uploadResult) {
       log(
-        `Upload sent ${(sent / 1e6).toFixed(2)} MB in ${((performance.now() - start)).toFixed(
-          1
-        )} ms (~${((sent * 8) / (performance.now() - start) / 1e3).toFixed(2)} Mbps)`
+        `Upload sent ${(ctx.uploadResult.bytes / 1e6).toFixed(2)} MB (${ctx.uploadResult.rate_mbps.toFixed(
+          2
+        )} Mbps)`
       );
     }
   }
