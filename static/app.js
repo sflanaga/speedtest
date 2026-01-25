@@ -20,70 +20,117 @@
       }, 1);
     });
 
+  const parseBytesInput = (s) => {
+    if (!s || !s.trim()) throw new Error("Empty byte value");
+    const m = s.trim().match(/^(\d+(?:\.\d+)?)(?:\s*(b|kb|kib|mb|mib|gb|gib))?$/i);
+    if (!m) throw new Error("Invalid byte value");
+    const num = parseFloat(m[1]);
+    const unit = (m[2] || "b").toLowerCase();
+    const mul = (() => {
+      switch (unit) {
+        case "b":
+          return 1;
+        case "kb":
+        case "kib":
+          return 1024;
+        case "mb":
+        case "mib":
+          return 1024 ** 2;
+        case "gb":
+        case "gib":
+          return 1024 ** 3;
+        default:
+          return 1;
+      }
+    })();
+    return Math.round(num * mul);
+  };
+
   document.getElementById("start").addEventListener("click", run);
 
+  async function loadDefaults() {
+    try {
+      const cfg = await fetch("/config").then((r) => r.json());
+      document.getElementById("chunkBytes").value = cfg.chunk_bytes;
+      document.getElementById("pingDuration").value = cfg.ping_duration_ms;
+      document.getElementById("pingMaxCount").value = cfg.ping_max_count ?? "";
+      document.getElementById("dlDuration").value = cfg.download_duration_ms;
+      document.getElementById("dlMaxBytes").value = cfg.download_max_bytes;
+      document.getElementById("ulDuration").value = cfg.upload_duration_ms;
+      document.getElementById("ulMaxBytes").value = cfg.upload_max_bytes;
+    } catch (e) {
+      console.warn("Failed to load defaults from /config", e);
+    }
+  }
+
+  loadDefaults();
+
   async function run() {
-    const url = document.getElementById("wsUrl").value;
-    const chunkBytes = parseInt(document.getElementById("chunkBytes").value, 10);
-    const pingDuration = parseInt(document.getElementById("pingDuration").value, 10);
-    const pingMaxCountInput = document.getElementById("pingMaxCount").value;
-    const pingMaxCount = pingMaxCountInput ? parseInt(pingMaxCountInput, 10) : null;
-    const dlDuration = parseInt(document.getElementById("dlDuration").value, 10);
-    const dlMaxBytes = parseInt(document.getElementById("dlMaxBytes").value, 10);
-    const ulDuration = parseInt(document.getElementById("ulDuration").value, 10);
-    const ulMaxBytes = parseInt(document.getElementById("ulMaxBytes").value, 10);
+    try {
+      const url = document.getElementById("wsUrl").value;
+      const chunkBytes = parseBytesInput(document.getElementById("chunkBytes").value);
+      const pingDuration = parseInt(document.getElementById("pingDuration").value, 10);
+      const pingMaxCountInput = document.getElementById("pingMaxCount").value;
+      const pingMaxCount = pingMaxCountInput ? parseInt(pingMaxCountInput, 10) : null;
+      const dlDuration = parseInt(document.getElementById("dlDuration").value, 10);
+      const dlMaxBytes = parseBytesInput(document.getElementById("dlMaxBytes").value);
+      const ulDuration = parseInt(document.getElementById("ulDuration").value, 10);
+      const ulMaxBytes = parseBytesInput(document.getElementById("ulMaxBytes").value);
 
-    log(
-      `===== Starting LAN speed test: ws=${url} chunk=${chunkBytes}B ping_dur=${pingDuration}ms ping_max=${pingMaxCount ?? "none"} dl_dur=${dlDuration}ms dl_max=${dlMaxBytes}B ul_dur=${ulDuration}ms ul_max=${ulMaxBytes}B =====`
-    );
+      log(
+        `===== Starting LAN speed test: ws=${url} chunk=${chunkBytes}B ping_dur=${pingDuration}ms ping_max=${pingMaxCount ?? "none"} dl_dur=${dlDuration}ms dl_max=${dlMaxBytes}B ul_dur=${ulDuration}ms ul_max=${ulMaxBytes}B =====`
+      );
 
-    const ws = new WebSocket(url);
-    ws.binaryType = "arraybuffer";
+      const ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
 
-    const ctx = {
-      ws,
-      chunkBytes,
-      pingDuration,
-      pingMaxCount,
-      dlDuration,
-      dlMaxBytes,
-      ulDuration,
-      ulMaxBytes,
-      uploadServerDone: false,
-      uploadDoneAck: null,
-      downloadResult: null,
-      uploadResult: null,
-    };
+      const ctx = {
+        ws,
+        chunkBytes,
+        pingDuration,
+        pingMaxCount,
+        dlDuration,
+        dlMaxBytes,
+        ulDuration,
+        ulMaxBytes,
+        uploadServerDone: false,
+        uploadDoneAck: null,
+        downloadResult: null,
+        uploadResult: null,
+      };
 
-    ws.onclose = () => log("WebSocket closed");
-    ws.onerror = (e) => log(`WebSocket error: ${e.message || e}`);
+      ws.onclose = () => log("WebSocket closed");
+      ws.onerror = (e) => log(`WebSocket error: ${e.message || e}`);
 
-    await once(ws, "open");
-    log("Connected", { verbose: true });
+      await once(ws, "open");
+      log("Connected", { verbose: true });
 
-    ws.onmessage = (evt) => {
-      if (typeof evt.data === "string") {
-        const msg = JSON.parse(evt.data);
-        handleControl(msg, ctx);
-      } else {
-        // Binary (download data)
-        ctx.downloadBytes = (ctx.downloadBytes || 0) + evt.data.byteLength;
-      }
-    };
+      ws.onmessage = (evt) => {
+        if (typeof evt.data === "string") {
+          const msg = JSON.parse(evt.data);
+          handleControl(msg, ctx);
+        } else {
+          // Binary (download data)
+          ctx.downloadBytes = (ctx.downloadBytes || 0) + evt.data.byteLength;
+        }
+      };
 
-    await pingPhase(ctx);
-    await downloadPhase(ctx);
-    await uploadPhase(ctx);
+      await pingPhase(ctx);
+      await downloadPhase(ctx);
+      await uploadPhase(ctx);
 
-    const pingAvg = ctx.pingStats.count ? ctx.pingStats.sum / ctx.pingStats.count : 0;
-    const dlRate = ctx.downloadResult?.rate_mbps ?? 0;
-    const ulRate = ctx.uploadResult?.rate_mbps ?? 0;
-    log(
-      `===== Summary: ping_avg=${pingAvg.toFixed(2)} ms download=${dlRate.toFixed(
-        2
-      )} Mbps upload=${ulRate.toFixed(2)} Mbps =====`
-    );
-    log("All phases done.");
+      const pingAvg = ctx.pingStats.count ? ctx.pingStats.sum / ctx.pingStats.count : 0;
+      const dlRate = ctx.downloadResult?.rate_mbps ?? 0;
+      const ulRate = ctx.uploadResult?.rate_mbps ?? 0;
+      log(
+        `===== Summary: ping_avg=${pingAvg.toFixed(2)} ms download=${dlRate.toFixed(
+          2
+        )} Mbps upload=${ulRate.toFixed(2)} Mbps =====`
+      );
+      log("All phases done.");
+    } catch (err) {
+      log(`Error: ${err.message || err}`);
+    }
   }
 
   function once(obj, event) {

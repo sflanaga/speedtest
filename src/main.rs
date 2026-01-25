@@ -15,10 +15,11 @@ use axum::{
     http::header,
     response::IntoResponse,
     routing::get,
-    Router,
+    Json, Router,
 };
+use byte_unit::Byte;
 use clap::Parser;
-    use futures_util::{sink::SinkExt, stream::StreamExt};
+use futures_util::{sink::SinkExt, stream::StreamExt};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use serde::Deserialize;
 use tokio::{
@@ -40,21 +41,34 @@ struct Cli {
     #[arg(long)]
     ping_max_count: Option<u64>,
 
-    #[arg(long, default_value_t = 5000)]
-    download_duration_ms: u64,
-    #[arg(long, default_value_t = 40_000_000)]
+    #[arg(long, default_value = "40000000", value_parser = parse_bytes)]
     download_max_bytes: u64,
 
     #[arg(long, default_value_t = 5000)]
-    upload_duration_ms: u64,
-    #[arg(long, default_value_t = 40_000_000)]
+    download_duration_ms: u64,
+
+    #[arg(long, default_value = "40000000", value_parser = parse_bytes)]
     upload_max_bytes: u64,
 
-    #[arg(long, default_value_t = 65_536)]
+    #[arg(long, default_value_t = 5000)]
+    upload_duration_ms: u64,
+
+    #[arg(long, default_value = "65536", value_parser = parse_chunk_bytes)]
     chunk_bytes: usize,
 
     #[arg(long, default_value_t = 250)]
     stats_interval_ms: u64,
+}
+
+fn parse_bytes(s: &str) -> Result<u64, String> {
+    Byte::from_str(s)
+        .map_err(|e| e.to_string())
+        .and_then(|b| u64::try_from(b.get_bytes()).map_err(|_| "value exceeds u64".to_string()))
+}
+
+fn parse_chunk_bytes(s: &str) -> Result<usize, String> {
+    let v = parse_bytes(s)?;
+    usize::try_from(v).map_err(|_| "chunk_bytes too large for usize".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +132,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
+        .route("/config", get(config))
         .route("/ws", get(ws_upgrade))
         .with_state(state);
 
@@ -150,6 +165,27 @@ async fn app_js() -> impl IntoResponse {
             (header::CONTENT_TYPE, "application/javascript"),
         ],
         include_str!("../static/app.js"),
+    )
+}
+
+async fn config(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg = &state.cfg;
+    (
+        [
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate, max-age=0"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        Json(serde_json::json!({
+            "ping_duration_ms": cfg.ping_duration_ms,
+            "ping_max_count": cfg.ping_max_count,
+            "download_duration_ms": cfg.download_duration_ms,
+            "download_max_bytes": cfg.download_max_bytes,
+            "upload_duration_ms": cfg.upload_duration_ms,
+            "upload_max_bytes": cfg.upload_max_bytes,
+            "chunk_bytes": cfg.chunk_bytes,
+        })),
     )
 }
 
