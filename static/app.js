@@ -85,6 +85,7 @@
         `===== Starting LAN speed test: ws=${url} chunk=${chunkBytes}B ping_dur=${pingDuration}ms ping_max=${pingMaxCount ?? "none"} dl_dur=${dlDuration}ms dl_max=${dlMaxBytes}B ul_dur=${ulDuration}ms ul_max=${ulMaxBytes}B =====`
       );
 
+      const t0 = performance.now();
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
 
@@ -103,8 +104,24 @@
         uploadResult: null,
       };
 
-      ws.onclose = () => log("WebSocket closed");
-      ws.onerror = (e) => log(`WebSocket error: ${e.message || e}`);
+      ws.onopen = () => {
+        const dt = (performance.now() - t0).toFixed(2);
+        log(`WebSocket open (dt=${dt} ms)`, { verbose: true });
+      };
+      ws.onclose = (e) => {
+        log(
+          `WebSocket closed: code=${e.code} reason=${e.reason || "<none>"} wasClean=${e.wasClean}`
+        );
+      };
+      ws.onerror = (e) => {
+        log(
+          `WebSocket error: ${e.message || e.type || e} ${
+            e?.currentTarget?.readyState !== undefined
+              ? `(readyState=${e.currentTarget.readyState})`
+              : ""
+          }`
+        );
+      };
 
       await once(ws, "open");
       log("Connected", { verbose: true });

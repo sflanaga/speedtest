@@ -9,6 +9,7 @@ use std::{
 
 use axum::{
     extract::{
+        connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
@@ -26,9 +27,10 @@ use tokio::{
     sync::Mutex,
     time::{interval, sleep},
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 type WsSender = futures_util::stream::SplitSink<WebSocket, Message>;
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lan-speedtest")]
@@ -145,14 +147,13 @@ async fn main() {
         .route("/app.js", get(app_js))
         .route("/config", get(config))
         .route("/ws", get(ws_upgrade))
-        .with_state(state);
+        .with_state(state)
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let addr: SocketAddr = cfg.bind.parse().expect("invalid bind address");
     info!("Listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app.into_make_service())
-        .await
-        .unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn index() -> impl IntoResponse {
@@ -203,11 +204,15 @@ async fn config(State(state): State<AppState>) -> impl IntoResponse {
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    ws.on_upgrade(move |socket| handle_socket(socket, state, conn_id, addr))
 }
 
-async fn handle_socket(stream: WebSocket, state: AppState) {
+async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: SocketAddr) {
+    info!(%conn_id, %addr, "ws connected");
+
     let (sender, mut receiver) = stream.split();
     let sender = Arc::new(Mutex::new(sender));
 
@@ -223,26 +228,38 @@ async fn handle_socket(stream: WebSocket, state: AppState) {
             Message::Text(txt) => {
                 let parsed: serde_json::Result<ControlMsg> = serde_json::from_str(&txt);
                 let Ok(ctrl) = parsed else {
-                    error!("Bad control message: {txt}");
+                    error!(%conn_id, %addr, raw=?txt, "Bad control message");
                     continue;
                 };
                 match ctrl.phase {
                     Phase::Ping => {
                         if ctrl.action.as_deref() == Some("start") {
-                            // No-op: client drives ping timing & completion
+                            debug!(%conn_id, %addr, "ping start");
                         } else {
-                            handle_ping_echo(ctrl, sender.clone()).await;
+                            handle_ping_echo(ctrl, sender.clone(), conn_id, addr).await;
                         }
                     }
                     Phase::Download => {
                         if ctrl.action.as_deref() == Some("start") {
                             if download_running.swap(true, Ordering::SeqCst) == false {
+                                let cfg_clone = state.cfg.clone();
+                                let chunk_buf = state.chunk_buf.clone();
+                                info!(
+                                    %conn_id,
+                                    %addr,
+                                    duration_ms=?ctrl.duration_ms.unwrap_or(cfg_clone.download_duration_ms),
+                                    max_bytes=?ctrl.max_bytes.unwrap_or(cfg_clone.download_max_bytes),
+                                    chunk_bytes=?ctrl.chunk_bytes.unwrap_or(cfg_clone.chunk_bytes),
+                                    "download start"
+                                );
                                 tokio::spawn(download_phase(
                                     sender.clone(),
-                                    state.chunk_buf.clone(),
-                                    state.cfg.clone(),
+                                    chunk_buf,
+                                    cfg_clone,
                                     ctrl,
                                     download_running.clone(),
+                                    conn_id,
+                                    addr,
                                 ));
                             }
                         }
@@ -252,10 +269,19 @@ async fn handle_socket(stream: WebSocket, state: AppState) {
                             upload_bytes.store(0, Ordering::SeqCst);
                             upload_start.store(now_ms(), Ordering::SeqCst);
                             upload_running.store(true, Ordering::SeqCst);
+                            info!(
+                                %conn_id,
+                                %addr,
+                                duration_ms=?ctrl.duration_ms.unwrap_or(state.cfg.upload_duration_ms),
+                                max_bytes=?ctrl.max_bytes.unwrap_or(state.cfg.upload_max_bytes),
+                                chunk_bytes=?ctrl.chunk_bytes.unwrap_or(state.cfg.chunk_bytes),
+                                "upload start"
+                            );
                         }
                         if ctrl.done.unwrap_or(false) {
                             let elapsed = now_ms() - upload_start.load(Ordering::SeqCst);
                             let bytes = ctrl.bytes_sent.unwrap_or(0);
+                            info!(%conn_id, %addr, bytes, elapsed_ms=elapsed, reason="client_done", "upload done");
                             let _ = send_control(
                                 sender.clone(),
                                 serde_json::json!({
@@ -284,6 +310,7 @@ async fn handle_socket(stream: WebSocket, state: AppState) {
                         } else {
                             "duration"
                         };
+                        info!(%conn_id, %addr, bytes, elapsed_ms=elapsed, reason, "upload done (server early_finish)");
                         let _ = send_control(
                             sender.clone(),
                             serde_json::json!({
@@ -298,19 +325,30 @@ async fn handle_socket(stream: WebSocket, state: AppState) {
                         .await;
                         upload_running.store(false, Ordering::SeqCst);
                     } else {
-                        // Periodic stats could be added via timer; keep binary path lightweight
+                        // Lightweight path; add interim stats here if desired.
                     }
                 }
             }
-            Message::Close(_) => break,
+            Message::Close(frame) => {
+                info!(%conn_id, %addr, ?frame, "ws close frame");
+                break;
+            }
             _ => {}
         }
     }
+
+    info!(%conn_id, %addr, "ws disconnected");
 }
 
 /// Responds to each ping echo message.
-async fn handle_ping_echo(ctrl: ControlMsg, sender: Arc<Mutex<WsSender>>) {
+async fn handle_ping_echo(
+    ctrl: ControlMsg,
+    sender: Arc<Mutex<WsSender>>,
+    conn_id: u64,
+    addr: SocketAddr,
+) {
     if let Some(t_send) = ctrl.t_send {
+        debug!(%conn_id, %addr, seq=?ctrl.seq, "ping echo");
         let _ = send_control(
             sender,
             serde_json::json!({
@@ -332,6 +370,8 @@ async fn download_phase(
     cfg: Cli,
     ctrl: ControlMsg,
     running: Arc<AtomicBool>,
+    conn_id: u64,
+    addr: SocketAddr,
 ) {
     let duration_ms = ctrl.duration_ms.unwrap_or(cfg.download_duration_ms);
     let max_bytes = ctrl.max_bytes.unwrap_or(cfg.download_max_bytes);
@@ -366,16 +406,18 @@ async fn download_phase(
 
         let chunk = &chunk_buf[..chunk_bytes.min(chunk_buf.len())];
         if let Err(err) = sender.lock().await.send(Message::Binary(chunk.to_vec())).await {
-            error!("Failed to send chunk: {err}");
+            error!(%conn_id, %addr, %err, "Failed to send chunk");
             break;
         }
         sent += chunk.len() as u64;
     }
 
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    info!(%conn_id, %addr, bytes=sent, elapsed_ms, reason, "download done");
     let _ = send_control(sender.clone(), serde_json::json!({
         "phase": "download",
         "bytes": sent,
-        "elapsed_ms": start.elapsed().as_millis() as u64,
+        "elapsed_ms": elapsed_ms,
         "done": true,
         "reason": reason
     }))
