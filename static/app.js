@@ -1,6 +1,8 @@
 (() => {
   const logEl = document.getElementById("log");
-  const log = (msg) => {
+  const verboseToggle = document.getElementById("verbose");
+  const log = (msg, { verbose = false } = {}) => {
+    if (verbose && !verboseToggle.checked) return;
     const t = new Date().toISOString();
     logEl.textContent += `[${t}] ${msg}\n`;
     logEl.scrollTop = logEl.scrollHeight;
@@ -21,7 +23,7 @@
     const ulDuration = parseInt(document.getElementById("ulDuration").value, 10);
     const ulMaxBytes = parseInt(document.getElementById("ulMaxBytes").value, 10);
 
-    log(`Connecting to ${url} ...`);
+    log(`Connecting to ${url} ...`, { verbose: true });
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
 
@@ -40,7 +42,7 @@
     ws.onerror = (e) => log(`WebSocket error: ${e.message || e}`);
 
     await once(ws, "open");
-    log("Connected");
+    log("Connected", { verbose: true });
 
     ws.onmessage = (evt) => {
       if (typeof evt.data === "string") {
@@ -56,7 +58,7 @@
     await downloadPhase(ctx);
     await uploadPhase(ctx);
 
-    log("All phases done. You can rerun.");
+    log("All phases done.");
   }
 
   function once(obj, event) {
@@ -65,7 +67,7 @@
 
   // ---------------- Ping ----------------
   async function pingPhase(ctx) {
-    log("Starting ping phase");
+    log("Starting ping phase", { verbose: true });
     ctx.pingStats = { count: 0, sum: 0, min: Infinity, max: 0 };
     ctx.awaiting = new Map();
 
@@ -97,10 +99,11 @@
 
     // Tell server we're done
     ctx.ws.send(JSON.stringify({ phase: "ping", done: true }));
+    const avg = ctx.pingStats.count ? ctx.pingStats.sum / ctx.pingStats.count : 0;
     log(
-      `Ping done: count=${ctx.pingStats.count} avg=${(
-        ctx.pingStats.sum / ctx.pingStats.count
-      ).toFixed(2)} ms min=${ctx.pingStats.min.toFixed(2)} ms max=${ctx.pingStats.max.toFixed(2)} ms`
+      `Ping done: count=${ctx.pingStats.count} avg=${avg.toFixed(2)} ms min=${ctx.pingStats.min.toFixed(
+        2
+      )} ms max=${ctx.pingStats.max.toFixed(2)} ms`
     );
   }
 
@@ -116,25 +119,23 @@
   }
 
   function handleControl(msg, ctx) {
-    if (msg.phase === "ping" && msg.t_send !== undefined && msg.t_recv !== undefined) {
+    if (msg.phase === "ping" && msg.t_send !== undefined) {
       const seq = msg.seq;
       const tSend = ctx.awaiting.get(seq);
       if (tSend != null) {
-        const rtt = msg.t_recv - tSend;
+        const rtt = nowMs() - tSend; // measure with client clock to avoid skew
         ctx.awaiting.delete(seq);
         ctx.pingStats.count += 1;
         ctx.pingStats.sum += rtt;
         ctx.pingStats.min = Math.min(ctx.pingStats.min, rtt);
         ctx.pingStats.max = Math.max(ctx.pingStats.max, rtt);
-        log(`Ping seq=${seq} rtt=${rtt.toFixed(2)} ms`);
+        log(`Ping seq=${seq} rtt=${rtt.toFixed(2)} ms`, { verbose: true });
       }
-    } else if (msg.phase === "ping" && msg.stats && msg.done) {
-      log(
-        `Ping summary: count=${msg.stats.count} avg=${msg.stats.avg_ms?.toFixed(2)} ms min=${msg.stats.min_ms?.toFixed(2)} ms max=${msg.stats.max_ms?.toFixed(2)} ms stddev=${msg.stats.stddev_ms?.toFixed(2)}`
-      );
     } else if (msg.phase === "download") {
       if (!msg.done) {
-        log(`Download interim: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms`);
+        log(`Download interim: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms`, {
+          verbose: true,
+        });
       } else {
         log(
           `Download done: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms reason=${msg.reason}`
@@ -142,7 +143,9 @@
       }
     } else if (msg.phase === "upload") {
       if (!msg.done) {
-        log(`Upload interim: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms`);
+        log(`Upload interim: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms`, {
+          verbose: true,
+        });
       } else {
         log(
           `Upload done: ${(msg.bytes / 1e6).toFixed(2)} MB in ${msg.elapsed_ms} ms reason=${msg.reason}`
@@ -154,7 +157,7 @@
 
   // ---------------- Download ----------------
   async function downloadPhase(ctx) {
-    log("Starting download phase");
+    log("Starting download phase", { verbose: true });
     ctx.downloadBytes = 0;
     ctx.ws.send(
       JSON.stringify({
@@ -189,7 +192,7 @@
 
   // ---------------- Upload ----------------
   async function uploadPhase(ctx) {
-    log("Starting upload phase");
+    log("Starting upload phase", { verbose: true });
     const buf = new Uint8Array(ctx.chunkBytes);
     crypto.getRandomValues(buf);
 
@@ -207,13 +210,11 @@
     let sent = 0;
 
     while (performance.now() - start < ctx.ulDuration && sent < ctx.ulMaxBytes) {
-        ctx.ws.send(buf);
-        sent += buf.byteLength;
-        // yield to event loop to avoid starving
-        if (sent % (ctx.chunkBytes * 8) === 0) await sleep(0);
+      ctx.ws.send(buf);
+      sent += buf.byteLength;
+      if (sent % (ctx.chunkBytes * 8) === 0) await sleep(0);
     }
 
-    // Signal done
     const elapsed = performance.now() - start;
     const ackPromise = new Promise((resolve) => (ctx.uploadDoneAck = resolve));
     ctx.ws.send(

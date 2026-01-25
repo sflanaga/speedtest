@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use axum::{
@@ -12,14 +12,15 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::{Html, IntoResponse},
+    http::header,
+    response::IntoResponse,
     routing::get,
     Router,
 };
 use clap::Parser;
-use futures_util::{sink::SinkExt, stream::StreamExt};
+    use futures_util::{sink::SinkExt, stream::StreamExt};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::{
     sync::Mutex,
     time::{interval, sleep},
@@ -95,55 +96,6 @@ struct ControlMsg {
     reason: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct Stats {
-    count: u64,
-    bytes: u64,
-    elapsed_ms: u64,
-    avg_ms: f64,
-    min_ms: f64,
-    max_ms: f64,
-    stddev_ms: f64,
-}
-
-#[derive(Default, Debug, Clone)]
-struct Welford {
-    count: u64,
-    mean: f64,
-    m2: f64,
-    min: f64,
-    max: f64,
-}
-impl Welford {
-    fn push(&mut self, sample: f64) {
-        self.count += 1;
-        if self.count == 1 {
-            self.mean = sample;
-            self.min = sample;
-            self.max = sample;
-            self.m2 = 0.0;
-            return;
-        }
-        let delta = sample - self.mean;
-        self.mean += delta / self.count as f64;
-        let delta2 = sample - self.mean;
-        self.m2 += delta * delta2;
-        if sample < self.min {
-            self.min = sample;
-        }
-        if sample > self.max {
-            self.max = sample;
-        }
-    }
-    fn stddev(&self) -> f64 {
-        if self.count > 1 {
-            (self.m2 / (self.count as f64 - 1.0)).sqrt()
-        } else {
-            0.0
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -178,11 +130,27 @@ async fn main() {
 }
 
 async fn index() -> impl IntoResponse {
-    Html(include_str!("../static/index.html"))
+    (
+        [
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate, max-age=0"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        ],
+        include_str!("../static/index.html"),
+    )
 }
 
 async fn app_js() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "application/javascript")], include_str!("../static/app.js"))
+    (
+        [
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate, max-age=0"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+            (header::CONTENT_TYPE, "application/javascript"),
+        ],
+        include_str!("../static/app.js"),
+    )
 }
 
 async fn ws_upgrade(
@@ -214,7 +182,7 @@ async fn handle_socket(stream: WebSocket, state: AppState) {
                 match ctrl.phase {
                     Phase::Ping => {
                         if ctrl.action.as_deref() == Some("start") {
-                            handle_ping_start(ctrl, sender.clone(), state.cfg.clone()).await;
+                            // No-op: client drives ping timing & completion
                         } else {
                             handle_ping_echo(ctrl, sender.clone()).await;
                         }
@@ -296,84 +264,18 @@ async fn handle_socket(stream: WebSocket, state: AppState) {
 /// Responds to each ping echo message.
 async fn handle_ping_echo(ctrl: ControlMsg, sender: Arc<Mutex<WsSender>>) {
     if let Some(t_send) = ctrl.t_send {
-        let now = now_ms();
         let _ = send_control(
             sender,
             serde_json::json!({
                 "phase": "ping",
                 "seq": ctrl.seq,
                 "t_send": t_send,
-                "t_recv": now,
+                // t_recv omitted; client measures RTT locally to avoid clock skew
                 "done": ctrl.done.unwrap_or(false),
             }),
         )
         .await;
     }
-}
-
-/// Starts the ping stats loop and termination watchdog.
-async fn handle_ping_start(
-    ctrl: ControlMsg,
-    sender: Arc<Mutex<WsSender>>,
-    cfg: Cli,
-) {
-    let duration_ms = ctrl.duration_ms.unwrap_or(cfg.ping_duration_ms);
-    let max_count = ctrl.max_count.or(cfg.ping_max_count);
-
-    tokio::spawn(async move {
-        let mut stats = Welford::default();
-        let start = Instant::now();
-        let mut ticker = interval(Duration::from_millis(cfg.stats_interval_ms));
-        let mut stop = false;
-
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if stats.count > 0 {
-                        let _ = send_control(sender.clone(), serde_json::json!({
-                            "phase": "ping",
-                            "stats": {
-                                "count": stats.count,
-                                "avg_ms": stats.mean,
-                                "min_ms": stats.min,
-                                "max_ms": stats.max,
-                                "stddev_ms": stats.stddev()
-                            },
-                            "done": false
-                        })).await;
-                    }
-                }
-                _ = sleep(Duration::from_millis(5)) => {}
-            }
-
-            if start.elapsed().as_millis() as u64 >= duration_ms {
-                stop = true;
-            }
-            if let Some(mc) = max_count {
-                if stats.count >= mc {
-                    stop = true;
-                }
-            }
-            if stop {
-                let _ = send_control(sender.clone(), serde_json::json!({
-                    "phase": "ping",
-                    "done": true,
-                    "reason": if start.elapsed().as_millis() as u64 >= duration_ms { "duration" } else { "count" },
-                    "stats": {
-                        "count": stats.count,
-                        "avg_ms": stats.mean,
-                        "min_ms": stats.min,
-                        "max_ms": stats.max,
-                        "stddev_ms": stats.stddev()
-                    },
-                    "early_finish": stop
-                })).await;
-                break;
-            }
-
-            // Stats updated on echoes; this loop just emits periodic stats.
-        }
-    });
 }
 
 /// Download phase: server → client binary chunks.
@@ -388,7 +290,7 @@ async fn download_phase(
     let max_bytes = ctrl.max_bytes.unwrap_or(cfg.download_max_bytes);
     let chunk_bytes = ctrl.chunk_bytes.unwrap_or(cfg.chunk_bytes);
 
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let mut sent: u64 = 0;
     let mut ticker = interval(Duration::from_millis(cfg.stats_interval_ms));
 
