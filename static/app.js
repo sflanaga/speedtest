@@ -22,16 +22,17 @@
   const waitForBufferedAmount = (ws, threshold = 256_000) =>
     new Promise((resolve) => {
       if (ws.bufferedAmount < threshold) return resolve();
-      // Use requestAnimationFrame for more efficient polling than setInterval(1)
-      const check = () => {
+      // Poll at 1ms intervals - browsers clamp to ~4ms but that's still faster than rAF
+      const id = setInterval(() => {
         if (ws.bufferedAmount < threshold) {
+          clearInterval(id);
           resolve();
-        } else {
-          requestAnimationFrame(check);
         }
-      };
-      requestAnimationFrame(check);
+      }, 1);
     });
+
+  // Yield via microtask queue (faster than setTimeout which has 4ms minimum)
+  const yieldMicrotask = () => new Promise((resolve) => queueMicrotask(resolve));
 
   // Accepts B, K, KB, KiB, M, MB, MiB, G, GB, GiB (case-insensitive)
   const parseBytesInput = (s) => {
@@ -341,30 +342,35 @@
     const endTime = start + ctx.ulDuration;
     let sent = 0;
     
-    // Batch size for sends before yielding
-    const BATCH_SIZE = 16;
-    // Higher buffer threshold for better throughput
-    const BUFFER_HIGH = 1_000_000;
-    const BUFFER_LOW = 500_000;
+    // Larger batch size - send more before yielding
+    const BATCH_SIZE = 64;
+    // Higher buffer threshold for better throughput (4MB high, 2MB low)
+    const BUFFER_HIGH = 4_000_000;
+    const BUFFER_LOW = 2_000_000;
+    
+    // Track iterations for periodic time checks
+    let iterations = 0;
 
     while (!ctx.uploadServerDone && sent < ctx.ulMaxBytes) {
-      // Check time less frequently - only when we yield
-      if (performance.now() >= endTime) break;
+      // Check time less frequently - every 8 batches (~32MB with 64KB chunks)
+      if (++iterations % 8 === 0) {
+        if (performance.now() >= endTime) break;
+      }
       
-      // Backpressure check
+      // Backpressure check - only when buffer is very full
       if (ctx.ws.bufferedAmount > BUFFER_HIGH) {
         await waitForBufferedAmount(ctx.ws, BUFFER_LOW);
         continue;
       }
       
-      // Batch send multiple chunks before yielding
+      // Batch send multiple chunks
       for (let i = 0; i < BATCH_SIZE && sent < ctx.ulMaxBytes && !ctx.uploadServerDone; i++) {
         ctx.ws.send(buf);
         sent += buf.byteLength;
       }
       
-      // Yield to allow message processing
-      await sleep(0);
+      // Yield via microtask to allow message processing without setTimeout delay
+      await yieldMicrotask();
     }
 
     if (!ctx.uploadServerDone) {
