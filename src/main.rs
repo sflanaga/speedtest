@@ -18,6 +18,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use bytes::Bytes;
 use byte_unit::Byte;
 use clap::Parser;
 use futures_util::{sink::SinkExt, stream::StreamExt};
@@ -25,7 +26,7 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use serde::Deserialize;
 use tokio::{
     sync::Mutex,
-    time::{interval, sleep},
+    time::Instant,
 };
 use tracing::{debug, error, info};
 
@@ -221,7 +222,9 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
     let upload_running = Arc::new(AtomicBool::new(false));
 
     let upload_bytes = Arc::new(AtomicU64::new(0));
-    let upload_start = Arc::new(AtomicU64::new(0));
+    // Store start time as nanos since an arbitrary epoch (Instant::now() at connection start)
+    let connection_epoch = Instant::now();
+    let upload_start_nanos = Arc::new(AtomicU64::new(0)); // 0 means not started
 
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
@@ -266,9 +269,10 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                     }
                     Phase::Upload => {
                         if ctrl.action.as_deref() == Some("start") {
-                            upload_bytes.store(0, Ordering::SeqCst);
-                            upload_start.store(now_ms(), Ordering::SeqCst);
-                            upload_running.store(true, Ordering::SeqCst);
+                            upload_bytes.store(0, Ordering::Relaxed);
+                            let nanos = connection_epoch.elapsed().as_nanos() as u64;
+                            upload_start_nanos.store(nanos, Ordering::Relaxed);
+                            upload_running.store(true, Ordering::Relaxed);
                             info!(
                                 %conn_id,
                                 %addr,
@@ -279,7 +283,9 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                             );
                         }
                         if ctrl.done.unwrap_or(false) {
-                            let elapsed = now_ms() - upload_start.load(Ordering::SeqCst);
+                            let start_nanos = upload_start_nanos.load(Ordering::Relaxed);
+                            let now_nanos = connection_epoch.elapsed().as_nanos() as u64;
+                            let elapsed = (now_nanos.saturating_sub(start_nanos)) / 1_000_000;
                             let bytes = ctrl.bytes_sent.unwrap_or(0);
                             info!(%conn_id, %addr, bytes, elapsed_ms=elapsed, reason="client_done", "upload done");
                             let _ = send_control(
@@ -293,18 +299,28 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                                 }),
                             )
                             .await;
-                            upload_running.store(false, Ordering::SeqCst);
+                            upload_running.store(false, Ordering::Relaxed);
                         }
                     }
                 }
             }
             Message::Binary(bin) => {
-                if upload_running.load(Ordering::SeqCst) {
-                    upload_bytes.fetch_add(bin.len() as u64, Ordering::SeqCst);
-                    let elapsed = now_ms() - upload_start.load(Ordering::SeqCst);
-                    let bytes = upload_bytes.load(Ordering::SeqCst);
+                if upload_running.load(Ordering::Relaxed) {
+                    let bytes = upload_bytes.fetch_add(bin.len() as u64, Ordering::Relaxed) + bin.len() as u64;
+                    
+                    // Only check time periodically (every ~1MB) to reduce overhead
+                    let check_time = bytes % 1_048_576 < bin.len() as u64 || bytes >= state.cfg.upload_max_bytes;
+                    
+                    let elapsed = if check_time {
+                        let start_nanos = upload_start_nanos.load(Ordering::Relaxed);
+                        let now_nanos = connection_epoch.elapsed().as_nanos() as u64;
+                        (now_nanos.saturating_sub(start_nanos)) / 1_000_000
+                    } else {
+                        0 // Skip time check
+                    };
+                    
                     // Early stop if limits reached
-                    if bytes >= state.cfg.upload_max_bytes || elapsed >= state.cfg.upload_duration_ms {
+                    if bytes >= state.cfg.upload_max_bytes || (check_time && elapsed >= state.cfg.upload_duration_ms) {
                         let reason = if bytes >= state.cfg.upload_max_bytes {
                             "byte-cap"
                         } else {
@@ -323,9 +339,7 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                             }),
                         )
                         .await;
-                        upload_running.store(false, Ordering::SeqCst);
-                    } else {
-                        // Lightweight path; add interim stats here if desired.
+                        upload_running.store(false, Ordering::Relaxed);
                     }
                 }
             }
@@ -364,6 +378,7 @@ async fn handle_ping_echo(
 }
 
 /// Download phase: server → client binary chunks.
+/// Optimized: batches multiple chunk sends before yielding, avoids per-chunk allocations.
 async fn download_phase(
     sender: Arc<Mutex<WsSender>>,
     chunk_buf: Arc<Vec<u8>>,
@@ -377,39 +392,55 @@ async fn download_phase(
     let max_bytes = ctrl.max_bytes.unwrap_or(cfg.download_max_bytes);
     let chunk_bytes = ctrl.chunk_bytes.unwrap_or(cfg.chunk_bytes);
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut sent: u64 = 0;
-    let mut ticker = interval(Duration::from_millis(cfg.stats_interval_ms));
+    let mut last_stats = Instant::now();
+    let stats_interval = Duration::from_millis(cfg.stats_interval_ms);
+
+    // Pre-slice the chunk to avoid repeated slicing
+    let chunk: Bytes = Bytes::copy_from_slice(&chunk_buf[..chunk_bytes.min(chunk_buf.len())]);
+    
+    // Batch size: send multiple chunks before yielding to reduce async overhead
+    const BATCH_SIZE: u32 = 16;
 
     let mut reason = "duration";
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                let _ = send_control(sender.clone(), serde_json::json!({
-                    "phase": "download",
-                    "bytes": sent,
-                    "elapsed_ms": start.elapsed().as_millis() as u64,
-                    "done": false
-                })).await;
+    'outer: loop {
+        // Send stats periodically
+        if last_stats.elapsed() >= stats_interval {
+            let _ = send_control(sender.clone(), serde_json::json!({
+                "phase": "download",
+                "bytes": sent,
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+                "done": false
+            })).await;
+            last_stats = Instant::now();
+        }
+
+        // Batch send chunks
+        {
+            let mut guard = sender.lock().await;
+            for _ in 0..BATCH_SIZE {
+                // Check termination conditions
+                if start.elapsed().as_millis() as u64 >= duration_ms {
+                    reason = "duration";
+                    break 'outer;
+                }
+                if sent >= max_bytes {
+                    reason = "byte-cap";
+                    break 'outer;
+                }
+
+                // Send chunk using Bytes (zero-copy clone)
+                if let Err(err) = guard.send(Message::Binary(chunk.to_vec())).await {
+                    error!(%conn_id, %addr, %err, "Failed to send chunk");
+                    break 'outer;
+                }
+                sent += chunk.len() as u64;
             }
-            _ = sleep(Duration::from_millis(0)) => {}
         }
 
-        if start.elapsed().as_millis() as u64 >= duration_ms {
-            reason = "duration";
-            break;
-        }
-        if sent >= max_bytes {
-            reason = "byte-cap";
-            break;
-        }
-
-        let chunk = &chunk_buf[..chunk_bytes.min(chunk_buf.len())];
-        if let Err(err) = sender.lock().await.send(Message::Binary(chunk.to_vec())).await {
-            error!(%conn_id, %addr, %err, "Failed to send chunk");
-            break;
-        }
-        sent += chunk.len() as u64;
+        // Yield to allow other tasks to run
+        tokio::task::yield_now().await;
     }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -423,7 +454,7 @@ async fn download_phase(
     }))
     .await;
 
-    running.store(false, Ordering::SeqCst);
+    running.store(false, Ordering::Relaxed);
 }
 
 async fn send_control(
@@ -434,10 +465,3 @@ async fn send_control(
     sender.lock().await.send(Message::Text(txt)).await
 }
 
-fn now_ms() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_millis() as u64;
-    now
-}

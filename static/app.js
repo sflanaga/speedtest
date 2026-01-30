@@ -22,12 +22,15 @@
   const waitForBufferedAmount = (ws, threshold = 256_000) =>
     new Promise((resolve) => {
       if (ws.bufferedAmount < threshold) return resolve();
-      const id = setInterval(() => {
+      // Use requestAnimationFrame for more efficient polling than setInterval(1)
+      const check = () => {
         if (ws.bufferedAmount < threshold) {
-          clearInterval(id);
           resolve();
+        } else {
+          requestAnimationFrame(check);
         }
-      }, 1);
+      };
+      requestAnimationFrame(check);
     });
 
   // Accepts B, K, KB, KiB, M, MB, MiB, G, GB, GiB (case-insensitive)
@@ -335,19 +338,33 @@
     );
 
     const start = performance.now();
+    const endTime = start + ctx.ulDuration;
     let sent = 0;
+    
+    // Batch size for sends before yielding
+    const BATCH_SIZE = 16;
+    // Higher buffer threshold for better throughput
+    const BUFFER_HIGH = 1_000_000;
+    const BUFFER_LOW = 500_000;
 
-    while (
-      !ctx.uploadServerDone &&
-      performance.now() - start < ctx.ulDuration &&
-      sent < ctx.ulMaxBytes
-    ) {
-      if (ctx.ws.bufferedAmount > 512_000) {
-        await waitForBufferedAmount(ctx.ws, 256_000);
+    while (!ctx.uploadServerDone && sent < ctx.ulMaxBytes) {
+      // Check time less frequently - only when we yield
+      if (performance.now() >= endTime) break;
+      
+      // Backpressure check
+      if (ctx.ws.bufferedAmount > BUFFER_HIGH) {
+        await waitForBufferedAmount(ctx.ws, BUFFER_LOW);
+        continue;
       }
-      ctx.ws.send(buf);
-      sent += buf.byteLength;
-      if (sent % (ctx.chunkBytes * 8) === 0) await sleep(0);
+      
+      // Batch send multiple chunks before yielding
+      for (let i = 0; i < BATCH_SIZE && sent < ctx.ulMaxBytes && !ctx.uploadServerDone; i++) {
+        ctx.ws.send(buf);
+        sent += buf.byteLength;
+      }
+      
+      // Yield to allow message processing
+      await sleep(0);
     }
 
     if (!ctx.uploadServerDone) {
