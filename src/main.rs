@@ -252,6 +252,10 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
     // Store start time as nanos since an arbitrary epoch (Instant::now() at connection start)
     let connection_epoch = Instant::now();
     let upload_start_nanos = Arc::new(AtomicU64::new(0)); // 0 means not started
+    
+    // Store client's requested upload limits (set when upload starts)
+    let upload_max_bytes = Arc::new(AtomicU64::new(state.cfg.upload_max_bytes));
+    let upload_duration_ms = Arc::new(AtomicU64::new(state.cfg.upload_duration_ms));
 
     // Track current test results
     let current_test: Arc<Mutex<TestResults>> = Arc::new(Mutex::new(TestResults::default()));
@@ -327,13 +331,18 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                             upload_bytes.store(0, Ordering::Relaxed);
                             let nanos = connection_epoch.elapsed().as_nanos() as u64;
                             upload_start_nanos.store(nanos, Ordering::Relaxed);
+                            // Store client's requested limits
+                            let req_max_bytes = ctrl.max_bytes.unwrap_or(state.cfg.upload_max_bytes);
+                            let req_duration_ms = ctrl.duration_ms.unwrap_or(state.cfg.upload_duration_ms);
+                            upload_max_bytes.store(req_max_bytes, Ordering::Relaxed);
+                            upload_duration_ms.store(req_duration_ms, Ordering::Relaxed);
                             upload_running.store(true, Ordering::Relaxed);
                             info!(
                                 %conn_id,
                                 %addr,
                                 test_id,
-                                duration_ms=?ctrl.duration_ms.unwrap_or(state.cfg.upload_duration_ms),
-                                max_bytes=?ctrl.max_bytes.unwrap_or(state.cfg.upload_max_bytes),
+                                duration_ms=req_duration_ms,
+                                max_bytes=req_max_bytes,
                                 chunk_bytes=?ctrl.chunk_bytes.unwrap_or(state.cfg.chunk_bytes),
                                 "upload start"
                             );
@@ -393,9 +402,11 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
             Message::Binary(bin) => {
                 if upload_running.load(Ordering::Relaxed) {
                     let bytes = upload_bytes.fetch_add(bin.len() as u64, Ordering::Relaxed) + bin.len() as u64;
+                    let max_bytes = upload_max_bytes.load(Ordering::Relaxed);
+                    let duration_ms = upload_duration_ms.load(Ordering::Relaxed);
                     
                     // Only check time periodically (every ~1MB) to reduce overhead
-                    let check_time = bytes % 1_048_576 < bin.len() as u64 || bytes >= state.cfg.upload_max_bytes;
+                    let check_time = bytes % 1_048_576 < bin.len() as u64 || bytes >= max_bytes;
                     
                     let elapsed = if check_time {
                         let start_nanos = upload_start_nanos.load(Ordering::Relaxed);
@@ -406,8 +417,8 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                     };
                     
                     // Early stop if limits reached
-                    if bytes >= state.cfg.upload_max_bytes || (check_time && elapsed >= state.cfg.upload_duration_ms) {
-                        let reason = if bytes >= state.cfg.upload_max_bytes {
+                    if bytes >= max_bytes || (check_time && elapsed >= duration_ms) {
+                        let reason = if bytes >= max_bytes {
                             "byte-cap"
                         } else {
                             "duration"
@@ -461,6 +472,8 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
             }
             Message::Close(frame) => {
                 info!(%conn_id, %addr, ?frame, "ws close frame");
+                // Send close frame back to complete the handshake
+                let _ = sender.lock().await.send(Message::Close(frame)).await;
                 break;
             }
             _ => {}

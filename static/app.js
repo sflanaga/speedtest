@@ -169,7 +169,17 @@
       log("All phases done.");
       
       // Close the WebSocket cleanly
-      ws.close();
+      // Create a promise that resolves when close completes with proper code
+      const closePromise = new Promise((resolve) => {
+        const originalOnClose = ws.onclose;
+        ws.onclose = (e) => {
+          if (originalOnClose) originalOnClose(e);
+          resolve(e);
+        };
+      });
+      
+      ws.close(1000, "test complete");
+      await closePromise;
     } catch (err) {
       log(`Error: ${err.message || err}`);
     }
