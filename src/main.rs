@@ -472,8 +472,27 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
             }
             Message::Close(frame) => {
                 info!(%conn_id, %addr, ?frame, "ws close frame");
-                // Send close frame back to complete the handshake
-                let _ = sender.lock().await.send(Message::Close(frame)).await;
+                
+                let mut guard = sender.lock().await;
+
+                // 1. Attempt to send (this might fail if library already queued a reply)
+                if let Err(e) = guard.send(Message::Close(frame)).await {
+                    tracing::warn!(%conn_id, %addr, error = %e, "failed to send close frame");
+                }
+
+                // 2. CRITICAL FIX: Force a flush.
+                // If 'send' failed above, it skipped flushing. We must manually flush
+                // to push the library's auto-generated Close frame out to the OS.
+                if let Err(e) = guard.flush().await {
+                    tracing::warn!(%conn_id, %addr, error = %e, "failed to flush close frame");
+                }
+
+                // Drop the lock explicitly (optional, but good practice before sleep)
+                drop(guard);
+
+                // 3. Wait for OS to transmit
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
                 break;
             }
             _ => {}
