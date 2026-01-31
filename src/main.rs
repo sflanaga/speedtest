@@ -33,6 +33,13 @@ use tracing::{debug, error, info};
 type WsSender = futures_util::stream::SplitSink<WebSocket, Message>;
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
+// Maximum limits to prevent resource exhaustion
+const MAX_DURATION_MS: u64 = 300_000;       // 5 minutes
+const MAX_BYTES: u64 = 10_737_418_240;      // 10 GB
+const MAX_CHUNK_BYTES: usize = 1_048_576;   // 1 MB
+const MAX_PING_COUNT: u64 = 5_000;          // 5,000 pings max
+const MIN_CHUNK_BYTES: usize = 64;          // 64 bytes minimum
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lan-speedtest")]
 #[command(author, version, about)]
@@ -46,8 +53,8 @@ struct Cli {
     ping_duration_ms: u64,
 
     /// Max number of pings to send
-    #[arg(short = 'c', long)]
-    ping_max_count: Option<u64>,
+    #[arg(short = 'c', long, default_value_t = 100)]
+    ping_max_count: u64,
 
     /// Max bytes to download (e.g. 40MB)
     #[arg(short = 'D', long, default_value = "40000000", value_parser = parse_bytes)]
@@ -97,6 +104,25 @@ enum Phase {
     Ping,
     Download,
     Upload,
+}
+
+#[derive(Debug)]
+struct ValidationError {
+    field: String,
+    value: String,
+    max: String,
+    message: String,
+}
+
+impl ValidationError {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error": self.message,
+            "field": self.field,
+            "value": self.value,
+            "max": self.max
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +175,103 @@ struct TestResults {
     upload_ms: u64,
     upload_mbps: f64,
     logged_complete: bool,
+}
+
+fn validate_control_msg(ctrl: &ControlMsg, cfg: &Cli) -> Option<ValidationError> {
+    match ctrl.phase {
+        Phase::Ping => {
+            if let Some(duration) = ctrl.duration_ms {
+                if duration > MAX_DURATION_MS {
+                    return Some(ValidationError {
+                        field: "ping_duration_ms".to_string(),
+                        value: duration.to_string(),
+                        max: MAX_DURATION_MS.to_string(),
+                        message: format!("Ping duration exceeds maximum of {}ms", MAX_DURATION_MS),
+                    });
+                }
+            }
+            if let Some(count) = ctrl.max_count {
+                if count > MAX_PING_COUNT {
+                    return Some(ValidationError {
+                        field: "ping_max_count".to_string(),
+                        value: count.to_string(),
+                        max: MAX_PING_COUNT.to_string(),
+                        message: format!("Ping count exceeds maximum of {}", MAX_PING_COUNT),
+                    });
+                }
+                // Also check against CLI default if not overridden
+                if count > cfg.ping_max_count && count != cfg.ping_max_count {
+                    // Allow override but log warning (will be logged at call site)
+                    debug!(cli_default=cfg.ping_max_count, requested=count, "Ping count exceeds CLI default");
+                }
+            }
+        }
+        Phase::Download => {
+            if let Some(duration) = ctrl.duration_ms {
+                if duration > MAX_DURATION_MS {
+                    return Some(ValidationError {
+                        field: "download_duration_ms".to_string(),
+                        value: duration.to_string(),
+                        max: MAX_DURATION_MS.to_string(),
+                        message: format!("Download duration exceeds maximum of {}ms", MAX_DURATION_MS),
+                    });
+                }
+            }
+            if let Some(bytes) = ctrl.max_bytes {
+                if bytes > MAX_BYTES {
+                    return Some(ValidationError {
+                        field: "download_max_bytes".to_string(),
+                        value: bytes.to_string(),
+                        max: MAX_BYTES.to_string(),
+                        message: format!("Download bytes exceed maximum of {}", MAX_BYTES),
+                    });
+                }
+            }
+            if let Some(chunk) = ctrl.chunk_bytes {
+                if chunk < MIN_CHUNK_BYTES || chunk > MAX_CHUNK_BYTES {
+                    return Some(ValidationError {
+                        field: "chunk_bytes".to_string(),
+                        value: chunk.to_string(),
+                        max: MAX_CHUNK_BYTES.to_string(),
+                        message: format!("Chunk size must be between {} and {} bytes", MIN_CHUNK_BYTES, MAX_CHUNK_BYTES),
+                    });
+                }
+            }
+        }
+        Phase::Upload => {
+            if let Some(duration) = ctrl.duration_ms {
+                if duration > MAX_DURATION_MS {
+                    return Some(ValidationError {
+                        field: "upload_duration_ms".to_string(),
+                        value: duration.to_string(),
+                        max: MAX_DURATION_MS.to_string(),
+                        message: format!("Upload duration exceeds maximum of {}ms", MAX_DURATION_MS),
+                    });
+                }
+            }
+            if let Some(bytes) = ctrl.max_bytes {
+                if bytes > MAX_BYTES {
+                    return Some(ValidationError {
+                        field: "upload_max_bytes".to_string(),
+                        value: bytes.to_string(),
+                        max: MAX_BYTES.to_string(),
+                        message: format!("Upload bytes exceed maximum of {}", MAX_BYTES),
+                    });
+                }
+            }
+            if let Some(chunk) = ctrl.chunk_bytes {
+                if chunk < MIN_CHUNK_BYTES || chunk > MAX_CHUNK_BYTES {
+                    return Some(ValidationError {
+                        field: "chunk_bytes".to_string(),
+                        value: chunk.to_string(),
+                        max: MAX_CHUNK_BYTES.to_string(),
+                        message: format!("Chunk size must be between {} and {} bytes", MIN_CHUNK_BYTES, MAX_CHUNK_BYTES),
+                    });
+                }
+            }
+        }
+    }
+    None
 }
 
 #[tokio::main]
@@ -225,6 +348,14 @@ async fn config(State(state): State<AppState>) -> impl IntoResponse {
             "upload_duration_ms": cfg.upload_duration_ms,
             "upload_max_bytes": cfg.upload_max_bytes,
             "chunk_bytes": cfg.chunk_bytes,
+            "max_ping_duration_ms": MAX_DURATION_MS,
+            "max_ping_count": MAX_PING_COUNT,
+            "max_download_duration_ms": MAX_DURATION_MS,
+            "max_download_bytes": MAX_BYTES,
+            "max_upload_duration_ms": MAX_DURATION_MS,
+            "max_upload_bytes": MAX_BYTES,
+            "max_chunk_bytes": MAX_CHUNK_BYTES,
+            "min_chunk_bytes": MIN_CHUNK_BYTES,
         })),
     )
 }
@@ -259,6 +390,10 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
 
     // Track current test results
     let current_test: Arc<Mutex<TestResults>> = Arc::new(Mutex::new(TestResults::default()));
+    
+    // Track ping count for this connection
+    let ping_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let ping_max_count_for_test: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
@@ -271,13 +406,28 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                 match ctrl.phase {
                     Phase::Ping => {
                         if ctrl.action.as_deref() == Some("start") {
+                            // Validate parameters before starting
+                            if let Some(err) = validate_control_msg(&ctrl, &state.cfg) {
+                                error!(%conn_id, %addr, field=%err.field, value=%err.value, max=%err.max, "Validation failed");
+                                let _ = send_control(
+                                    sender.clone(),
+                                    err.to_json(),
+                                ).await;
+                                continue;
+                            }
+                            
+                            // Reset ping count and set max for this test
+                            ping_count.store(0, Ordering::Relaxed);
+                            let max_count = ctrl.max_count.unwrap_or(state.cfg.ping_max_count).min(MAX_PING_COUNT);
+                            ping_max_count_for_test.store(max_count, Ordering::Relaxed);
+                            
                             let test_id = ctrl.test_id.unwrap_or(0);
                             {
                                 let mut test = current_test.lock().await;
                                 *test = TestResults::default();
                                 test.test_id = test_id;
                             }
-                            info!(%conn_id, %addr, test_id, "ping start");
+                            info!(%conn_id, %addr, test_id, max_count, "ping start");
                         } else if ctrl.done.unwrap_or(false) {
                             // Client sends final ping stats
                             let test_id = ctrl.test_id.unwrap_or(0);
@@ -294,11 +444,21 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                             }
                             info!(%conn_id, %addr, test_id, ping_count, ping_avg_ms=format!("{:.2}", ping_avg), ping_min_ms=format!("{:.2}", ping_min), ping_max_ms=format!("{:.2}", ping_max), "ping done");
                         } else {
-                            handle_ping_echo(ctrl, sender.clone(), conn_id, addr).await;
+                            handle_ping_echo(ctrl, sender.clone(), conn_id, addr, ping_count.clone(), ping_max_count_for_test.clone()).await;
                         }
                     }
                     Phase::Download => {
                         if ctrl.action.as_deref() == Some("start") {
+                            // Validate parameters before starting
+                            if let Some(err) = validate_control_msg(&ctrl, &state.cfg) {
+                                error!(%conn_id, %addr, field=%err.field, value=%err.value, max=%err.max, "Validation failed");
+                                let _ = send_control(
+                                    sender.clone(),
+                                    err.to_json(),
+                                ).await;
+                                continue;
+                            }
+                            
                             if download_running.swap(true, Ordering::SeqCst) == false {
                                 let cfg_clone = state.cfg.clone();
                                 let chunk_buf = state.chunk_buf.clone();
@@ -328,6 +488,16 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                     Phase::Upload => {
                         let test_id = ctrl.test_id.unwrap_or(0);
                         if ctrl.action.as_deref() == Some("start") {
+                            // Validate parameters before starting
+                            if let Some(err) = validate_control_msg(&ctrl, &state.cfg) {
+                                error!(%conn_id, %addr, field=%err.field, value=%err.value, max=%err.max, "Validation failed");
+                                let _ = send_control(
+                                    sender.clone(),
+                                    err.to_json(),
+                                ).await;
+                                continue;
+                            }
+                            
                             upload_bytes.store(0, Ordering::Relaxed);
                             let nanos = connection_epoch.elapsed().as_nanos() as u64;
                             upload_start_nanos.store(nanos, Ordering::Relaxed);
@@ -508,9 +678,28 @@ async fn handle_ping_echo(
     sender: Arc<Mutex<WsSender>>,
     conn_id: u64,
     addr: SocketAddr,
+    ping_count: Arc<AtomicU64>,
+    ping_max_count: Arc<AtomicU64>,
 ) {
     if let Some(t_send) = ctrl.t_send {
-        debug!(%conn_id, %addr, seq=?ctrl.seq, "ping echo");
+        // Check if we've exceeded the ping count limit
+        let current_count = ping_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let max_count = ping_max_count.load(Ordering::Relaxed);
+        
+        if current_count > max_count {
+            error!(%conn_id, %addr, current_count, max_count, "Ping count exceeded");
+            let _ = send_control(
+                sender,
+                serde_json::json!({
+                    "phase": "ping",
+                    "error": format!("Ping count exceeded maximum of {}", max_count),
+                    "done": true,
+                }),
+            ).await;
+            return;
+        }
+        
+        debug!(%conn_id, %addr, seq=?ctrl.seq, count=current_count, max=max_count, "ping echo");
         let _ = send_control(
             sender,
             serde_json::json!({

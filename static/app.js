@@ -69,16 +69,63 @@
   async function loadDefaults() {
     try {
       const cfg = await fetch("/config").then((r) => r.json());
+      
+      // Store limits for validation
+      window.configLimits = {
+        maxPingDurationMs: cfg.max_ping_duration_ms,
+        maxPingCount: cfg.max_ping_count,
+        maxDownloadDurationMs: cfg.max_download_duration_ms,
+        maxDownloadBytes: cfg.max_download_bytes,
+        maxUploadDurationMs: cfg.max_upload_duration_ms,
+        maxUploadBytes: cfg.max_upload_bytes,
+        maxChunkBytes: cfg.max_chunk_bytes,
+        minChunkBytes: cfg.min_chunk_bytes,
+      };
+      
+      // Set default values
       document.getElementById("chunkBytes").value = cfg.chunk_bytes;
       document.getElementById("pingDuration").value = cfg.ping_duration_ms;
-      document.getElementById("pingMaxCount").value = cfg.ping_max_count ?? "";
+      document.getElementById("pingMaxCount").value = cfg.ping_max_count;
       document.getElementById("dlDuration").value = cfg.download_duration_ms;
       document.getElementById("dlMaxBytes").value = cfg.download_max_bytes;
       document.getElementById("ulDuration").value = cfg.upload_duration_ms;
       document.getElementById("ulMaxBytes").value = cfg.upload_max_bytes;
+      
+      // Add limit information to input titles and display
+      document.getElementById("pingDuration").title = `Max: ${cfg.max_ping_duration_ms}ms`;
+      document.getElementById("pingDurationLimit").textContent = `(max: ${cfg.max_ping_duration_ms}ms)`;
+      
+      document.getElementById("pingMaxCount").title = `Max: ${cfg.max_ping_count}`;
+      document.getElementById("pingMaxCountLimit").textContent = `(max: ${cfg.max_ping_count})`;
+      
+      document.getElementById("dlDuration").title = `Max: ${cfg.max_download_duration_ms}ms`;
+      document.getElementById("dlDurationLimit").textContent = `(max: ${cfg.max_download_duration_ms}ms)`;
+      
+      document.getElementById("dlMaxBytes").title = `Max: ${formatBytes(cfg.max_download_bytes)}`;
+      document.getElementById("dlMaxBytesLimit").textContent = `(max: ${formatBytes(cfg.max_download_bytes)})`;
+      
+      document.getElementById("ulDuration").title = `Max: ${cfg.max_upload_duration_ms}ms`;
+      document.getElementById("ulDurationLimit").textContent = `(max: ${cfg.max_upload_duration_ms}ms)`;
+      
+      document.getElementById("ulMaxBytes").title = `Max: ${formatBytes(cfg.max_upload_bytes)}`;
+      document.getElementById("ulMaxBytesLimit").textContent = `(max: ${formatBytes(cfg.max_upload_bytes)})`;
+      
+      document.getElementById("chunkBytes").title = `Range: ${cfg.min_chunk_bytes} - ${cfg.max_chunk_bytes} bytes`;
+      document.getElementById("chunkBytesLimit").textContent = `(range: ${formatBytes(cfg.min_chunk_bytes)} - ${formatBytes(cfg.max_chunk_bytes)})`;
     } catch (e) {
       console.warn("Failed to load defaults from /config", e);
     }
+  }
+  
+  function formatBytes(bytes) {
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let size = bytes;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex++;
+    }
+    return `${size.toFixed(1)} ${units[unitIndex]}`;
   }
 
   loadDefaults();
@@ -94,6 +141,33 @@
       const dlMaxBytes = parseBytesInput(document.getElementById("dlMaxBytes").value);
       const ulDuration = parseInt(document.getElementById("ulDuration").value, 10);
       const ulMaxBytes = parseBytesInput(document.getElementById("ulMaxBytes").value);
+      
+      // Client-side validation using server-provided limits
+      if (window.configLimits) {
+        const limits = window.configLimits;
+        
+        if (pingDuration > limits.maxPingDurationMs) {
+          throw new Error(`Ping duration exceeds maximum of ${limits.maxPingDurationMs}ms`);
+        }
+        if (pingMaxCount && pingMaxCount > limits.maxPingCount) {
+          throw new Error(`Ping count exceeds maximum of ${limits.maxPingCount}`);
+        }
+        if (dlDuration > limits.maxDownloadDurationMs) {
+          throw new Error(`Download duration exceeds maximum of ${limits.maxDownloadDurationMs}ms`);
+        }
+        if (dlMaxBytes > limits.maxDownloadBytes) {
+          throw new Error(`Download bytes exceed maximum of ${formatBytes(limits.maxDownloadBytes)}`);
+        }
+        if (ulDuration > limits.maxUploadDurationMs) {
+          throw new Error(`Upload duration exceeds maximum of ${limits.maxUploadDurationMs}ms`);
+        }
+        if (ulMaxBytes > limits.maxUploadBytes) {
+          throw new Error(`Upload bytes exceed maximum of ${formatBytes(limits.maxUploadBytes)}`);
+        }
+        if (chunkBytes < limits.minChunkBytes || chunkBytes > limits.maxChunkBytes) {
+          throw new Error(`Chunk size must be between ${limits.minChunkBytes} and ${limits.maxChunkBytes} bytes`);
+        }
+      }
 
       log(
         `===== Starting LAN speed test: ws=${url} chunk=${chunkBytes}B ping_dur=${pingDuration}ms ping_max=${pingMaxCount ?? "none"} dl_dur=${dlDuration}ms dl_max=${dlMaxBytes}B ul_dur=${ulDuration}ms ul_max=${ulMaxBytes}B =====`
@@ -147,6 +221,13 @@
       ws.onmessage = (evt) => {
         if (typeof evt.data === "string") {
           const msg = JSON.parse(evt.data);
+          
+          // Check for validation errors from server
+          if (msg.error) {
+            log(`Error: ${msg.error} (field: ${msg.field}, value: ${msg.value}, max: ${msg.max})`);
+            return;
+          }
+          
           handleControl(msg, ctx);
         } else {
           // Binary (download data)
@@ -207,7 +288,7 @@
 
     const endTime = performance.now() + ctx.pingDuration;
     let seq = 0;
-    while (performance.now() < endTime) {
+    while (performance.now() < endTime && !ctx.pingStopped) {
       if (ctx.pingMaxCount && seq >= ctx.pingMaxCount) break;
       const tSend = nowMs();
       ctx.awaiting.set(seq, tSend);
@@ -255,17 +336,24 @@
   }
 
   function handleControl(msg, ctx) {
-    if (msg.phase === "ping" && msg.t_send !== undefined) {
-      const seq = msg.seq;
-      const tSend = ctx.awaiting.get(seq);
-      if (tSend != null) {
-        const rtt = nowMs() - tSend;
-        ctx.awaiting.delete(seq);
-        ctx.pingStats.count += 1;
-        ctx.pingStats.sum += rtt;
-        ctx.pingStats.min = Math.min(ctx.pingStats.min, rtt);
-        ctx.pingStats.max = Math.max(ctx.pingStats.max, rtt);
-        log(`Ping seq=${seq} rtt=${rtt.toFixed(2)} ms`, { verbose: true });
+    if (msg.phase === "ping") {
+      if (msg.error) {
+        log(`Error: ${msg.error}`);
+        ctx.pingStopped = true;
+        return;
+      }
+      if (msg.t_send !== undefined) {
+        const seq = msg.seq;
+        const tSend = ctx.awaiting.get(seq);
+        if (tSend != null) {
+          const rtt = nowMs() - tSend;
+          ctx.awaiting.delete(seq);
+          ctx.pingStats.count += 1;
+          ctx.pingStats.sum += rtt;
+          ctx.pingStats.min = Math.min(ctx.pingStats.min, rtt);
+          ctx.pingStats.max = Math.max(ctx.pingStats.max, rtt);
+          log(`Ping seq=${seq} rtt=${rtt.toFixed(2)} ms`, { verbose: true });
+        }
       }
     } else if (msg.phase === "download") {
       if (!msg.done) {
@@ -352,7 +440,14 @@
   async function uploadPhase(ctx) {
     log(">>> Upload phase starting");
     const buf = new Uint8Array(ctx.chunkBytes);
-    crypto.getRandomValues(buf);
+    
+    // Fill buffer with random values in chunks of 65536 bytes (browser limit)
+    const chunkSize = 65536;
+    for (let offset = 0; offset < buf.length; offset += chunkSize) {
+      const size = Math.min(chunkSize, buf.length - offset);
+      const view = new Uint8Array(buf.buffer, offset, size);
+      crypto.getRandomValues(view);
+    }
 
     ctx.uploadServerDone = false;
     ctx.uploadServerResult = null;

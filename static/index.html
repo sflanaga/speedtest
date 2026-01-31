@@ -7,19 +7,20 @@
     body { font-family: sans-serif; margin: 2rem; }
     pre { background: #f4f4f4; padding: 1rem; }
     label { display: block; margin-top: 0.5rem; }
+    .limit-info { font-size: 0.8em; color: #666; margin-left: 0.5rem; }
   </style>
 </head>
 <body>
   <h1>LAN Speed Test</h1>
   <div>
     <label>Server WS URL: <input id="wsUrl" size="40" value="ws://localhost:8080/ws" /></label>
-    <label>Chunk bytes: <input id="chunkBytes" type="text" value="65536" /></label>
-    <label>Ping duration (ms): <input id="pingDuration" type="number" value="5000" /></label>
-    <label>Ping max count (optional): <input id="pingMaxCount" type="number" /></label>
-    <label>Download duration (ms): <input id="dlDuration" type="number" value="5000" /></label>
-    <label>Download max bytes: <input id="dlMaxBytes" type="text" value="40000000" /></label>
-    <label>Upload duration (ms): <input id="ulDuration" type="number" value="5000" /></label>
-    <label>Upload max bytes: <input id="ulMaxBytes" type="text" value="40000000" /></label>
+    <label>Chunk bytes: <input id="chunkBytes" type="text" value="65536" /> <span id="chunkBytesLimit" class="limit-info"></span></label>
+    <label>Ping duration (ms): <input id="pingDuration" type="number" value="5000" /> <span id="pingDurationLimit" class="limit-info"></span></label>
+    <label>Ping max count: <input id="pingMaxCount" type="number" value="100" /> <span id="pingMaxCountLimit" class="limit-info"></span></label>
+    <label>Download duration (ms): <input id="dlDuration" type="number" value="5000" /> <span id="dlDurationLimit" class="limit-info"></span></label>
+    <label>Download max bytes: <input id="dlMaxBytes" type="text" value="40000000" /> <span id="dlMaxBytesLimit" class="limit-info"></span></label>
+    <label>Upload duration (ms): <input id="ulDuration" type="number" value="5000" /> <span id="ulDurationLimit" class="limit-info"></span></label>
+    <label>Upload max bytes: <input id="ulMaxBytes" type="text" value="40000000" /> <span id="ulMaxBytesLimit" class="limit-info"></span></label>
     <label><input id="verbose" type="checkbox" /> Verbose logging</label>
     <button id="start">Run Test</button>
   </div>
