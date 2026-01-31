@@ -16,3 +16,6 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 futures-util = "0.3"
 byte-unit = "4"
 bytes = "1"
+tokio-tungstenite = "0.24"
+url = "2.4"
+getrandom = "0.2"
