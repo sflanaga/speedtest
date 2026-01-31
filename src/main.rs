@@ -105,6 +105,8 @@ struct ControlMsg {
     #[serde(default)]
     action: Option<String>, // "start" for phases
     #[serde(default)]
+    test_id: Option<u64>,
+    #[serde(default)]
     seq: Option<u64>,
     #[serde(default)]
     t_send: Option<u64>,
@@ -122,6 +124,31 @@ struct ControlMsg {
     bytes_sent: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    ping_count: Option<u64>,
+    #[serde(default)]
+    ping_avg_ms: Option<f64>,
+    #[serde(default)]
+    ping_min_ms: Option<f64>,
+    #[serde(default)]
+    ping_max_ms: Option<f64>,
+}
+
+/// Tracks results for a single test run
+#[derive(Debug, Default)]
+struct TestResults {
+    test_id: u64,
+    ping_count: u64,
+    ping_avg_ms: f64,
+    ping_min_ms: f64,
+    ping_max_ms: f64,
+    download_bytes: u64,
+    download_ms: u64,
+    download_mbps: f64,
+    upload_bytes: u64,
+    upload_ms: u64,
+    upload_mbps: f64,
+    logged_complete: bool,
 }
 
 #[tokio::main]
@@ -226,6 +253,9 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
     let connection_epoch = Instant::now();
     let upload_start_nanos = Arc::new(AtomicU64::new(0)); // 0 means not started
 
+    // Track current test results
+    let current_test: Arc<Mutex<TestResults>> = Arc::new(Mutex::new(TestResults::default()));
+
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(txt) => {
@@ -237,7 +267,28 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                 match ctrl.phase {
                     Phase::Ping => {
                         if ctrl.action.as_deref() == Some("start") {
-                            debug!(%conn_id, %addr, "ping start");
+                            let test_id = ctrl.test_id.unwrap_or(0);
+                            {
+                                let mut test = current_test.lock().await;
+                                *test = TestResults::default();
+                                test.test_id = test_id;
+                            }
+                            info!(%conn_id, %addr, test_id, "ping start");
+                        } else if ctrl.done.unwrap_or(false) {
+                            // Client sends final ping stats
+                            let test_id = ctrl.test_id.unwrap_or(0);
+                            let ping_count = ctrl.ping_count.unwrap_or(0);
+                            let ping_avg = ctrl.ping_avg_ms.unwrap_or(0.0);
+                            let ping_min = ctrl.ping_min_ms.unwrap_or(0.0);
+                            let ping_max = ctrl.ping_max_ms.unwrap_or(0.0);
+                            {
+                                let mut test = current_test.lock().await;
+                                test.ping_count = ping_count;
+                                test.ping_avg_ms = ping_avg;
+                                test.ping_min_ms = ping_min;
+                                test.ping_max_ms = ping_max;
+                            }
+                            info!(%conn_id, %addr, test_id, ping_count, ping_avg_ms=format!("{:.2}", ping_avg), ping_min_ms=format!("{:.2}", ping_min), ping_max_ms=format!("{:.2}", ping_max), "ping done");
                         } else {
                             handle_ping_echo(ctrl, sender.clone(), conn_id, addr).await;
                         }
@@ -247,9 +298,11 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                             if download_running.swap(true, Ordering::SeqCst) == false {
                                 let cfg_clone = state.cfg.clone();
                                 let chunk_buf = state.chunk_buf.clone();
+                                let test_id = ctrl.test_id.unwrap_or(0);
                                 info!(
                                     %conn_id,
                                     %addr,
+                                    test_id,
                                     duration_ms=?ctrl.duration_ms.unwrap_or(cfg_clone.download_duration_ms),
                                     max_bytes=?ctrl.max_bytes.unwrap_or(cfg_clone.download_max_bytes),
                                     chunk_bytes=?ctrl.chunk_bytes.unwrap_or(cfg_clone.chunk_bytes),
@@ -261,6 +314,7 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                                     cfg_clone,
                                     ctrl,
                                     download_running.clone(),
+                                    current_test.clone(),
                                     conn_id,
                                     addr,
                                 ));
@@ -268,6 +322,7 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                         }
                     }
                     Phase::Upload => {
+                        let test_id = ctrl.test_id.unwrap_or(0);
                         if ctrl.action.as_deref() == Some("start") {
                             upload_bytes.store(0, Ordering::Relaxed);
                             let nanos = connection_epoch.elapsed().as_nanos() as u64;
@@ -276,6 +331,7 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                             info!(
                                 %conn_id,
                                 %addr,
+                                test_id,
                                 duration_ms=?ctrl.duration_ms.unwrap_or(state.cfg.upload_duration_ms),
                                 max_bytes=?ctrl.max_bytes.unwrap_or(state.cfg.upload_max_bytes),
                                 chunk_bytes=?ctrl.chunk_bytes.unwrap_or(state.cfg.chunk_bytes),
@@ -287,7 +343,37 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                             let now_nanos = connection_epoch.elapsed().as_nanos() as u64;
                             let elapsed = (now_nanos.saturating_sub(start_nanos)) / 1_000_000;
                             let bytes = ctrl.bytes_sent.unwrap_or(0);
-                            info!(%conn_id, %addr, bytes, elapsed_ms=elapsed, reason="client_done", "upload done");
+                            let rate_mbps = if elapsed > 0 { (bytes as f64 * 8.0) / (elapsed as f64 * 1000.0) } else { 0.0 };
+                            
+                            // Update test results and log summary (only once)
+                            {
+                                let mut test = current_test.lock().await;
+                                if !test.logged_complete {
+                                    test.upload_bytes = bytes;
+                                    test.upload_ms = elapsed;
+                                    test.upload_mbps = rate_mbps;
+                                    test.logged_complete = true;
+                                    
+                                    info!(
+                                        %conn_id,
+                                        %addr,
+                                        test_id = test.test_id,
+                                        ping_count = test.ping_count,
+                                        ping_avg_ms = format!("{:.2}", test.ping_avg_ms),
+                                        ping_min_ms = format!("{:.2}", test.ping_min_ms),
+                                        ping_max_ms = format!("{:.2}", test.ping_max_ms),
+                                        download_mbps = format!("{:.2}", test.download_mbps),
+                                        download_bytes = test.download_bytes,
+                                        download_ms = test.download_ms,
+                                        upload_mbps = format!("{:.2}", test.upload_mbps),
+                                        upload_bytes = test.upload_bytes,
+                                        upload_ms = test.upload_ms,
+                                        "TEST COMPLETE"
+                                    );
+                                }
+                            }
+                            
+                            info!(%conn_id, %addr, test_id, bytes, elapsed_ms=elapsed, rate_mbps=format!("{:.2}", rate_mbps), reason="client_done", "upload done");
                             let _ = send_control(
                                 sender.clone(),
                                 serde_json::json!({
@@ -326,7 +412,37 @@ async fn handle_socket(stream: WebSocket, state: AppState, conn_id: u64, addr: S
                         } else {
                             "duration"
                         };
-                        info!(%conn_id, %addr, bytes, elapsed_ms=elapsed, reason, "upload done (server early_finish)");
+                        let rate_mbps = if elapsed > 0 { (bytes as f64 * 8.0) / (elapsed as f64 * 1000.0) } else { 0.0 };
+                        
+                        // Update test results and log summary (only once)
+                        {
+                            let mut test = current_test.lock().await;
+                            if !test.logged_complete {
+                                test.upload_bytes = bytes;
+                                test.upload_ms = elapsed;
+                                test.upload_mbps = rate_mbps;
+                                test.logged_complete = true;
+                                
+                                info!(
+                                    %conn_id,
+                                    %addr,
+                                    test_id = test.test_id,
+                                    ping_count = test.ping_count,
+                                    ping_avg_ms = format!("{:.2}", test.ping_avg_ms),
+                                    ping_min_ms = format!("{:.2}", test.ping_min_ms),
+                                    ping_max_ms = format!("{:.2}", test.ping_max_ms),
+                                    download_mbps = format!("{:.2}", test.download_mbps),
+                                    download_bytes = test.download_bytes,
+                                    download_ms = test.download_ms,
+                                    upload_mbps = format!("{:.2}", test.upload_mbps),
+                                    upload_bytes = test.upload_bytes,
+                                    upload_ms = test.upload_ms,
+                                    "TEST COMPLETE"
+                                );
+                            }
+                        }
+                        
+                        info!(%conn_id, %addr, bytes, elapsed_ms=elapsed, rate_mbps=format!("{:.2}", rate_mbps), reason, "upload done (server early_finish)");
                         let _ = send_control(
                             sender.clone(),
                             serde_json::json!({
@@ -385,9 +501,11 @@ async fn download_phase(
     cfg: Cli,
     ctrl: ControlMsg,
     running: Arc<AtomicBool>,
+    current_test: Arc<Mutex<TestResults>>,
     conn_id: u64,
     addr: SocketAddr,
 ) {
+    let test_id = ctrl.test_id.unwrap_or(0);
     let duration_ms = ctrl.duration_ms.unwrap_or(cfg.download_duration_ms);
     let max_bytes = ctrl.max_bytes.unwrap_or(cfg.download_max_bytes);
     let chunk_bytes = ctrl.chunk_bytes.unwrap_or(cfg.chunk_bytes);
@@ -444,7 +562,17 @@ async fn download_phase(
     }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
-    info!(%conn_id, %addr, bytes=sent, elapsed_ms, reason, "download done");
+    let rate_mbps = if elapsed_ms > 0 { (sent as f64 * 8.0) / (elapsed_ms as f64 * 1000.0) } else { 0.0 };
+    
+    // Update test results
+    {
+        let mut test = current_test.lock().await;
+        test.download_bytes = sent;
+        test.download_ms = elapsed_ms;
+        test.download_mbps = rate_mbps;
+    }
+    
+    info!(%conn_id, %addr, test_id, bytes=sent, elapsed_ms, rate_mbps=format!("{:.2}", rate_mbps), reason, "download done");
     let _ = send_control(sender.clone(), serde_json::json!({
         "phase": "download",
         "bytes": sent,

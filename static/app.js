@@ -103,8 +103,12 @@
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
 
+      // Generate a unique test ID for this run
+      const testId = Date.now();
+      
       const ctx = {
         ws,
+        testId,
         chunkBytes,
         pingDuration,
         pingMaxCount,
@@ -163,6 +167,9 @@
         )} Mbps upload=${ulRate.toFixed(2)} Mbps =====`
       );
       log("All phases done.");
+      
+      // Close the WebSocket cleanly
+      ws.close();
     } catch (err) {
       log(`Error: ${err.message || err}`);
     }
@@ -182,6 +189,7 @@
       JSON.stringify({
         phase: "ping",
         action: "start",
+        test_id: ctx.testId,
         duration_ms: ctx.pingDuration,
         max_count: ctx.pingMaxCount ?? undefined,
       })
@@ -204,8 +212,20 @@
       seq += 1;
     }
 
-    ctx.ws.send(JSON.stringify({ phase: "ping", done: true }));
     const avg = ctx.pingStats.count ? ctx.pingStats.sum / ctx.pingStats.count : 0;
+    const minVal = ctx.pingStats.min === Infinity ? 0 : ctx.pingStats.min;
+    const maxVal = ctx.pingStats.max;
+    
+    // Send ping stats to server
+    ctx.ws.send(JSON.stringify({
+      phase: "ping",
+      done: true,
+      test_id: ctx.testId,
+      ping_count: ctx.pingStats.count,
+      ping_avg_ms: avg,
+      ping_min_ms: minVal,
+      ping_max_ms: maxVal,
+    }));
     log(
       `Ping done: count=${ctx.pingStats.count} avg=${avg.toFixed(2)} ms min=${ctx.pingStats.min.toFixed(
         2
@@ -289,6 +309,7 @@
       JSON.stringify({
         phase: "download",
         action: "start",
+        test_id: ctx.testId,
         duration_ms: ctx.dlDuration,
         max_bytes: ctx.dlMaxBytes,
         chunk_bytes: ctx.chunkBytes,
@@ -332,6 +353,7 @@
       JSON.stringify({
         phase: "upload",
         action: "start",
+        test_id: ctx.testId,
         duration_ms: ctx.ulDuration,
         max_bytes: ctx.ulMaxBytes,
         chunk_bytes: ctx.chunkBytes,
@@ -348,17 +370,23 @@
     const BUFFER_HIGH = 4_000_000;
     const BUFFER_LOW = 2_000_000;
     
-    // Track iterations for periodic time checks
+    // Track iterations for periodic time/macrotask checks
     let iterations = 0;
 
+    let backpressureWaits = 0;
+    let lastLogTime = start;
+    
     while (!ctx.uploadServerDone && sent < ctx.ulMaxBytes) {
-      // Check time less frequently - every 8 batches (~32MB with 64KB chunks)
-      if (++iterations % 8 === 0) {
+      iterations++;
+      
+      // Check time periodically
+      if (iterations % 16 === 0) {
         if (performance.now() >= endTime) break;
       }
       
       // Backpressure check - only when buffer is very full
       if (ctx.ws.bufferedAmount > BUFFER_HIGH) {
+        backpressureWaits++;
         await waitForBufferedAmount(ctx.ws, BUFFER_LOW);
         continue;
       }
@@ -369,9 +397,24 @@
         sent += buf.byteLength;
       }
       
-      // Yield via microtask to allow message processing without setTimeout delay
-      await yieldMicrotask();
+      // Debug: log progress every second
+      const now = performance.now();
+      if (now - lastLogTime > 1000) {
+        log(`Upload progress: ${(sent / 1e6).toFixed(2)} MB, iterations=${iterations}, backpressureWaits=${backpressureWaits}, bufferedAmount=${ctx.ws.bufferedAmount}`, { verbose: true });
+        lastLogTime = now;
+      }
+      
+      // Every 4 iterations, use setTimeout to allow macrotask queue (WebSocket messages) to process
+      // This is critical - microtasks don't yield to the event loop for onmessage handlers
+      if (iterations % 4 === 0) {
+        await sleep(0); // macrotask yield - allows onmessage to fire
+      } else {
+        // Yield via microtask for most iterations (fast)
+        await yieldMicrotask();
+      }
     }
+    
+    log(`Upload loop ended: iterations=${iterations}, backpressureWaits=${backpressureWaits}`, { verbose: true });
 
     if (!ctx.uploadServerDone) {
       const elapsed = performance.now() - start;
@@ -379,6 +422,7 @@
         JSON.stringify({
           phase: "upload",
           done: true,
+          test_id: ctx.testId,
           bytes_sent: sent,
           elapsed_ms: Math.round(elapsed),
         })
